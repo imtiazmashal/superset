@@ -17,6 +17,7 @@
 
 
 import logging
+import time
 import uuid
 from contextlib import nullcontext
 from inspect import isclass
@@ -25,6 +26,7 @@ from unittest.mock import call, Mock, patch
 
 import pytest
 from pytest_mock import MockerFixture
+from sqlalchemy.exc import SQLAlchemyError
 
 from superset.utils import decorators
 from superset.utils.backports import StrEnum
@@ -56,6 +58,39 @@ def test_debounce() -> None:
     result = myfunc(1, 0, kwarg1="haha", kwarg2=2)
     mock.assert_has_calls([call(1, "abc"), call(1, "haha")])
     assert result == 3
+
+
+def test_debounce_reexecutes_after_duration() -> None:
+    """Once the debounce window elapses, the function runs again."""
+    mock = Mock()
+
+    @decorators.debounce(0.05)
+    def myfunc(arg1: int) -> int:
+        mock(arg1)
+        return arg1
+
+    assert myfunc(1) == 1
+    assert myfunc(1) == 1
+    mock.assert_called_once_with(1)
+
+    # after the debounce duration the function is invoked again
+    time.sleep(0.06)
+    assert myfunc(1) == 1
+    assert mock.call_count == 2
+
+
+def test_debounce_caches_per_arguments() -> None:
+    """Different arguments are cached independently, not throttled together."""
+    mock = Mock()
+
+    @decorators.debounce()
+    def myfunc(arg1: int) -> int:
+        mock(arg1)
+        return arg1 * 10
+
+    assert myfunc(1) == 10
+    assert myfunc(2) == 20
+    assert mock.call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -346,3 +381,80 @@ def test_transacation_nested(mocker: MockerFixture) -> None:
         nested()
     db.session.commit.assert_not_called()
     db.session.rollback.assert_called_once()
+
+
+def test_stats_timing_records_elapsed() -> None:
+    """`stats_timing` yields the start time and records the elapsed duration."""
+    stats_logger = Mock()
+
+    with patch.object(
+        decorators, "now_as_float", side_effect=[100.0, 175.0]
+    ) as now_mock:
+        with decorators.stats_timing("my.key", stats_logger) as start_ts:
+            assert start_ts == 100.0
+
+    assert now_mock.call_count == 2
+    stats_logger.timing.assert_called_once_with("my.key", 75.0)
+
+
+def test_stats_timing_records_on_exception() -> None:
+    """Timing is reported even when the wrapped block raises."""
+    stats_logger = Mock()
+
+    with patch.object(decorators, "now_as_float", side_effect=[10.0, 30.0]):
+        with pytest.raises(ValueError, match="boom"):
+            with decorators.stats_timing("err.key", stats_logger):
+                raise ValueError("boom")
+
+    stats_logger.timing.assert_called_once_with("err.key", 20.0)
+
+
+def test_arghash_is_deterministic_and_order_independent() -> None:
+    """Equal args produce equal hashes regardless of kwargs ordering."""
+    h1 = decorators.arghash((1, 2), {"a": 1, "b": 2})
+    h2 = decorators.arghash((1, 2), {"b": 2, "a": 1})
+    assert h1 == h2
+
+
+def test_arghash_differs_for_different_arguments() -> None:
+    """Different arguments produce different hashes."""
+    assert decorators.arghash((1,), {}) != decorators.arghash((2,), {})
+    assert decorators.arghash((), {"a": 1}) != decorators.arghash((), {"a": 2})
+
+
+def test_on_error_reraises_mapped_exception() -> None:
+    """A caught exception is re-raised as the configured `reraise` type."""
+    source = SQLAlchemyError("db down")
+
+    with pytest.raises(SQLAlchemyError):
+        decorators.on_error(source)
+
+
+def test_on_error_swallows_when_no_reraise() -> None:
+    """When `reraise` is None a caught exception is swallowed (no raise)."""
+    source = SQLAlchemyError("db down")
+
+    decorators.on_error(source, reraise=None)
+
+
+def test_on_error_propagates_uncaught_exception() -> None:
+    """Exceptions outside `catches` are re-raised unchanged."""
+    source = ValueError("not a db error")
+
+    with pytest.raises(ValueError, match="not a db error") as exc_info:
+        decorators.on_error(source)
+    assert exc_info.value is source
+
+
+def test_on_security_exception_returns_403() -> None:
+    """`on_security_exception` delegates to `self.response` with a 403."""
+    api = Mock()
+    ex = Exception("forbidden")
+
+    result = decorators.on_security_exception(api, ex)
+
+    assert result is api.response.return_value
+    api.response.assert_called_once()
+    args, kwargs = api.response.call_args
+    assert args[0] == 403
+    assert "message" in kwargs
