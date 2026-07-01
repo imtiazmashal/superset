@@ -243,7 +243,7 @@ filelock==3.20.3
     # via
     #   -c requirements/base-constraint.txt
     #   virtualenv
-flask==2.1.1
+flask==2.2.1
     # via
     #   -c requirements/base-constraint.txt
     #   apache-superset
